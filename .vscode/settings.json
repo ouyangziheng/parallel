@@ -1,0 +1,7 @@
+{
+  "editor.tabSize": 4, // 缩进宽度为4个空格
+  "editor.insertSpaces": true, // 使用空格而不是Tab
+  "editor.detectIndentation": false, // 禁止自动检测缩进方式
+  "editor.formatOnSave": true, // 自动保存时格式化代码
+  "editor.rulers": [80] // 每行
+}
