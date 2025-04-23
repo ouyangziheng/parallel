@@ -2,3 +2,7 @@
 *.fbin
 main
 files
+.vscode
+*.o
+*.e
+*.out
