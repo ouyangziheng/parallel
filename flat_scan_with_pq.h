@@ -28,12 +28,10 @@ void quantize_vector(const float* src, uint8_t* dst, float& scale,
     scale = (max_val - min_val) / 255.0f;
     offset = min_val;
 
-    // 如果所有值相同，避免除以零
-    if (max_val == min_val) {
+    if (min_val == max_val) {
         scale = 1.0f;
-        for (size_t i = 0; i < vecdim; i++) {
-            dst[i] = 0;
-        }
+        std::fill(dst, dst + vecdim, 0);  // 量化结果为0
+        offset = min_val;
         return;
     }
 
@@ -94,7 +92,7 @@ float inner_product_quantized(const uint8_t* b1, const uint8_t* b2,
 
 
 // 使用标量量化的扁平扫描搜索函数
-std::priority_queue<std::pair<float, uint32_t>> flat_search_with_sq(
+std::priority_queue<std::pair<float, uint32_t>> flat_search_with_pq(
     float* base, float* query, size_t base_number, size_t vecdim, size_t k) {
       
     std::priority_queue<std::pair<float, uint32_t>> q;
@@ -109,8 +107,8 @@ std::priority_queue<std::pair<float, uint32_t>> flat_search_with_sq(
     float* scales = new float[base_number];
     float* offsets = new float[base_number];
 
-// 使用多线程进行量化0
-// #pragma omp parallel for 
+// 使用多线程进行量化
+#pragma omp parallel for 
     for (int i = 0; i < base_number; ++i) {
         quantize_vector(base + i * vecdim, base_quantized + i * vecdim,
                         scales[i], offsets[i], vecdim);
