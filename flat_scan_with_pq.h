@@ -85,9 +85,27 @@ float inner_product_quantized(const uint8_t* b1, const uint8_t* b2,
         sum += static_cast<int32_t>(b1[i]) * static_cast<int32_t>(b2[i]);
     }
 
-    // 反量化结果
-    float result = sum * scale1 * scale2 + vecdim * offset1 * offset2;
-    return 1.0f - result;  // 返回内积距离
+    // 反量化结果 - 修正公式
+    // 原始数据: src1[i] = b1[i] * scale1 + offset1, src2[i] = b2[i] * scale2 + offset2
+    // 内积计算: sum(src1[i] * src2[i]) = sum((b1[i] * scale1 + offset1) * (b2[i] * scale2 + offset2))
+    // 展开: sum(b1[i] * b2[i] * scale1 * scale2 + b1[i] * scale1 * offset2 + b2[i] * scale2 * offset1 + offset1 * offset2)
+    
+    float scale_product = scale1 * scale2;
+    float sum_b1b2 = static_cast<float>(sum);
+    
+    // 计算 b1 和 b2 的总和
+    int b1_sum = 0, b2_sum = 0;
+    for (size_t i = 0; i < vecdim; i++) {
+        b1_sum += static_cast<int>(b1[i]);
+        b2_sum += static_cast<int>(b2[i]);
+    }
+    
+    float ip = sum_b1b2 * scale_product + 
+              b1_sum * scale1 * offset2 + 
+              b2_sum * scale2 * offset1 + 
+              vecdim * offset1 * offset2;
+    
+    return 1.0f - ip;  // 返回内积距离
 }
 
 
@@ -109,24 +127,24 @@ std::priority_queue<std::pair<float, uint32_t>> flat_search_with_pq(
 
 // 使用多线程进行量化
 #pragma omp parallel for 
-    for (int i = 0; i < base_number; ++i) {
+    for (size_t i = 0; i < base_number; ++i) {
         quantize_vector(base + i * vecdim, base_quantized + i * vecdim,
                         scales[i], offsets[i], vecdim);
     }
 
     // 计算量化后的距离
-    for (int i = 0; i < base_number; ++i) {
+    for (size_t i = 0; i < base_number; ++i) {
         float dis = inner_product_quantized(
             base_quantized + i * vecdim, query_quantized, scales[i], offsets[i],
             query_scale, query_offset, vecdim);
 
         // 保持 top-k 最小距离
         if (q.size() < k) {
-            q.push({dis, i});
+            q.push({dis, static_cast<uint32_t>(i)});
         } else {
             if (dis < q.top().first) {
-                q.push({dis, i});
                 q.pop();
+                q.push({dis, static_cast<uint32_t>(i)});
             }
         }
     }
