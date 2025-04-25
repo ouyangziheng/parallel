@@ -4,6 +4,14 @@
 #include <algorithm>
 #include <cstdint>
 #include <queue>
+#include <vector>
+#include <random>
+#include <cmath>
+#include <memory>
+#include <functional>
+#include <chrono>
+#include <omp.h>
+#include <fstream>
 
 #include "simd_utils.h"
 
@@ -19,7 +27,29 @@ void quantize_vector(const float* src, uint8_t* dst, float& scale,
     float min_val = src[0];
     float max_val = src[0];
 
-    for (size_t i = 1; i < vecdim; i++) {
+    // 使用SIMD优化查找最大最小值
+    size_t i = 0;
+    float32x4_t vmin = vdupq_n_f32(src[0]);
+    float32x4_t vmax = vdupq_n_f32(src[0]);
+
+    // 每次处理4个值
+    for (; i + 3 < vecdim; i += 4) {
+        float32x4_t v = vld1q_f32(src + i);
+        vmin = vminq_f32(vmin, v);
+        vmax = vmaxq_f32(vmax, v);
+    }
+
+    // 合并最小值和最大值
+    float32x2_t min2 = vpmin_f32(vget_low_f32(vmin), vget_high_f32(vmin));
+    min2 = vpmin_f32(min2, min2);
+    min_val = vget_lane_f32(min2, 0);
+
+    float32x2_t max2 = vpmax_f32(vget_low_f32(vmax), vget_high_f32(vmax));
+    max2 = vpmax_f32(max2, max2);
+    max_val = vget_lane_f32(max2, 0);
+
+    // 处理剩余元素
+    for (; i < vecdim; i++) {
         if (src[i] < min_val) min_val = src[i];
         if (src[i] > max_val) max_val = src[i];
     }
@@ -28,86 +58,191 @@ void quantize_vector(const float* src, uint8_t* dst, float& scale,
     scale = (max_val - min_val) / 255.0f;
     offset = min_val;
 
-    if (min_val == max_val) {
+    if (min_val == max_val || scale < 1e-10) {
         scale = 1.0f;
         std::fill(dst, dst + vecdim, 0);  // 量化结果为0
         offset = min_val;
         return;
     }
 
-    // 量化
-    for (size_t i = 0; i < vecdim; i++) {
-        float normalized = (src[i] - offset) / scale;
+    // 预计算量化系数，避免除法
+    float inv_scale = 1.0f / scale;
+    
+    // 使用SIMD优化量化过程
+    i = 0;
+    float32x4_t voffset = vdupq_n_f32(offset);
+    float32x4_t vinv_scale = vdupq_n_f32(inv_scale);
+    float32x4_t vzero = vdupq_n_f32(0.0f);
+    float32x4_t v255 = vdupq_n_f32(255.0f);
+    
+    for (; i + 3 < vecdim; i += 4) {
+        float32x4_t v = vld1q_f32(src + i);
+        // 归一化: (src - offset) / scale
+        float32x4_t normalized = vmulq_f32(vsubq_f32(v, voffset), vinv_scale);
+        // 裁剪到 [0, 255]
+        normalized = vmaxq_f32(normalized, vzero);
+        normalized = vminq_f32(normalized, v255);
+        // 转为整数
+        int32x4_t int_vals = vcvtq_s32_f32(normalized);
+        // 转为 16位
+        int16x4_t int16_vals = vmovn_s32(int_vals);
+        // 转为 8位
+        uint8x8_t uint8_vals = vreinterpret_u8_s8(vmovn_s16(vcombine_s16(int16_vals, int16_vals)));
+        // 存储4个字节
+        vst1_lane_u32((uint32_t*)(dst + i), vreinterpret_u32_u8(uint8_vals), 0);
+    }
+
+    // 处理剩余元素
+    for (; i < vecdim; i++) {
+        float normalized = (src[i] - offset) * inv_scale;
         dst[i] = static_cast<uint8_t>(clamp(std::round(normalized), 0.0f, 255.0f));
     }
 }
 
-
 // 使用量化计算内积距离
 float inner_product_quantized(const uint8_t* b1, const uint8_t* b2,
-                              const float scale1, const float offset1,
-                              const float scale2, const float offset2,
-                              size_t vecdim) {
-    int32_t sum = 0;
-
+                             const float scale1, const float offset1,
+                             const float scale2, const float offset2,
+                             size_t vecdim) {
     // SIMD优化的8位整数内积计算
     size_t i = 0;
-
+    
     // 使用NEON进行SIMD加速
-    int32x4_t sum_vec = vdupq_n_s32(0);
+    int32x4_t sum_vec1 = vdupq_n_s32(0);
+    int32x4_t sum_vec2 = vdupq_n_s32(0);
+    int32x4_t sum_vec3 = vdupq_n_s32(0);
+    int32x4_t sum_vec4 = vdupq_n_s32(0);
+    
+    // 累加b1和b2向量的和，后续反量化会用到
+    uint32x4_t b1_sum_vec = vdupq_n_u32(0);
+    uint32x4_t b2_sum_vec = vdupq_n_u32(0);
 
+    // 每次处理64个元素，提高SIMD并行度
+    for (; i + 63 < vecdim; i += 64) {
+        // 处理第一组16个元素
+        uint8x16_t v1_1 = vld1q_u8(b1 + i);
+        uint8x16_t v2_1 = vld1q_u8(b2 + i);
+        
+        // 累加向量和
+        b1_sum_vec = vaddq_u32(b1_sum_vec, vpaddlq_u16(vpaddlq_u8(v1_1)));
+        b2_sum_vec = vaddq_u32(b2_sum_vec, vpaddlq_u16(vpaddlq_u8(v2_1)));
+
+        // 转换为16位整数并计算乘积
+        int16x8_t low1_1 = vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(v1_1)));
+        int16x8_t high1_1 = vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(v1_1)));
+        int16x8_t low2_1 = vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(v2_1)));
+        int16x8_t high2_1 = vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(v2_1)));
+
+        // 计算乘积并累加
+        sum_vec1 = vmlal_s16(sum_vec1, vget_low_s16(low1_1), vget_low_s16(low2_1));
+        sum_vec1 = vmlal_s16(sum_vec1, vget_high_s16(low1_1), vget_high_s16(low2_1));
+        sum_vec1 = vmlal_s16(sum_vec1, vget_low_s16(high1_1), vget_low_s16(high2_1));
+        sum_vec1 = vmlal_s16(sum_vec1, vget_high_s16(high1_1), vget_high_s16(high2_1));
+
+        // 处理第二组16个元素
+        uint8x16_t v1_2 = vld1q_u8(b1 + i + 16);
+        uint8x16_t v2_2 = vld1q_u8(b2 + i + 16);
+        
+        // 累加向量和
+        b1_sum_vec = vaddq_u32(b1_sum_vec, vpaddlq_u16(vpaddlq_u8(v1_2)));
+        b2_sum_vec = vaddq_u32(b2_sum_vec, vpaddlq_u16(vpaddlq_u8(v2_2)));
+
+        int16x8_t low1_2 = vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(v1_2)));
+        int16x8_t high1_2 = vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(v1_2)));
+        int16x8_t low2_2 = vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(v2_2)));
+        int16x8_t high2_2 = vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(v2_2)));
+
+        sum_vec2 = vmlal_s16(sum_vec2, vget_low_s16(low1_2), vget_low_s16(low2_2));
+        sum_vec2 = vmlal_s16(sum_vec2, vget_high_s16(low1_2), vget_high_s16(low2_2));
+        sum_vec2 = vmlal_s16(sum_vec2, vget_low_s16(high1_2), vget_low_s16(high2_2));
+        sum_vec2 = vmlal_s16(sum_vec2, vget_high_s16(high1_2), vget_high_s16(high2_2));
+        
+        // 处理第三组16个元素
+        uint8x16_t v1_3 = vld1q_u8(b1 + i + 32);
+        uint8x16_t v2_3 = vld1q_u8(b2 + i + 32);
+        
+        // 累加向量和
+        b1_sum_vec = vaddq_u32(b1_sum_vec, vpaddlq_u16(vpaddlq_u8(v1_3)));
+        b2_sum_vec = vaddq_u32(b2_sum_vec, vpaddlq_u16(vpaddlq_u8(v2_3)));
+
+        int16x8_t low1_3 = vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(v1_3)));
+        int16x8_t high1_3 = vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(v1_3)));
+        int16x8_t low2_3 = vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(v2_3)));
+        int16x8_t high2_3 = vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(v2_3)));
+
+        sum_vec3 = vmlal_s16(sum_vec3, vget_low_s16(low1_3), vget_low_s16(low2_3));
+        sum_vec3 = vmlal_s16(sum_vec3, vget_high_s16(low1_3), vget_high_s16(low2_3));
+        sum_vec3 = vmlal_s16(sum_vec3, vget_low_s16(high1_3), vget_low_s16(high2_3));
+        sum_vec3 = vmlal_s16(sum_vec3, vget_high_s16(high1_3), vget_high_s16(high2_3));
+
+        // 处理第四组16个元素
+        uint8x16_t v1_4 = vld1q_u8(b1 + i + 48);
+        uint8x16_t v2_4 = vld1q_u8(b2 + i + 48);
+        
+        // 累加向量和
+        b1_sum_vec = vaddq_u32(b1_sum_vec, vpaddlq_u16(vpaddlq_u8(v1_4)));
+        b2_sum_vec = vaddq_u32(b2_sum_vec, vpaddlq_u16(vpaddlq_u8(v2_4)));
+
+        int16x8_t low1_4 = vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(v1_4)));
+        int16x8_t high1_4 = vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(v1_4)));
+        int16x8_t low2_4 = vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(v2_4)));
+        int16x8_t high2_4 = vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(v2_4)));
+
+        sum_vec4 = vmlal_s16(sum_vec4, vget_low_s16(low1_4), vget_low_s16(low2_4));
+        sum_vec4 = vmlal_s16(sum_vec4, vget_high_s16(low1_4), vget_high_s16(low2_4));
+        sum_vec4 = vmlal_s16(sum_vec4, vget_low_s16(high1_4), vget_low_s16(high2_4));
+        sum_vec4 = vmlal_s16(sum_vec4, vget_high_s16(high1_4), vget_high_s16(high2_4));
+    }
+
+    // 继续处理16个元素一组的数据
     for (; i + 15 < vecdim; i += 16) {
-        // 128 = 8 * 16 每个点均为 8 位整数
         uint8x16_t v1 = vld1q_u8(b1 + i);
         uint8x16_t v2 = vld1q_u8(b2 + i);
+        
+        // 累加向量和
+        b1_sum_vec = vaddq_u32(b1_sum_vec, vpaddlq_u16(vpaddlq_u8(v1)));
+        b2_sum_vec = vaddq_u32(b2_sum_vec, vpaddlq_u16(vpaddlq_u8(v2)));
 
-        // 将8位无符号整数转换为16位有符号整数
-        // 防止超出范围
-        // vget_low_u8(v1) 用于加载前 8 个
         int16x8_t low1 = vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(v1)));
         int16x8_t high1 = vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(v1)));
         int16x8_t low2 = vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(v2)));
         int16x8_t high2 = vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(v2)));
 
-        // 计算乘积并累加
-        sum_vec = vmlal_s16(sum_vec, vget_low_s16(low1), vget_low_s16(low2));
-        sum_vec = vmlal_s16(sum_vec, vget_high_s16(low1), vget_high_s16(low2));
-        sum_vec = vmlal_s16(sum_vec, vget_low_s16(high1), vget_low_s16(high2));
-        sum_vec = vmlal_s16(sum_vec, vget_high_s16(high1), vget_high_s16(high2));
+        sum_vec1 = vmlal_s16(sum_vec1, vget_low_s16(low1), vget_low_s16(low2));
+        sum_vec1 = vmlal_s16(sum_vec1, vget_high_s16(low1), vget_high_s16(low2));
+        sum_vec1 = vmlal_s16(sum_vec1, vget_low_s16(high1), vget_low_s16(high2));
+        sum_vec1 = vmlal_s16(sum_vec1, vget_high_s16(high1), vget_high_s16(high2));
     }
 
+    // 合并所有部分和
+    int32x4_t total_sum_vec = vaddq_s32(vaddq_s32(sum_vec1, sum_vec2), vaddq_s32(sum_vec3, sum_vec4));
+    
     // 将向量中的元素相加
-    sum = vaddvq_s32(sum_vec); 
-
+    int32_t sum = vaddvq_s32(total_sum_vec);
+    
+    // 计算b1和b2向量的和
+    uint32_t b1_sum = vaddvq_u32(b1_sum_vec);
+    uint32_t b2_sum = vaddvq_u32(b2_sum_vec);
 
     // 处理剩余元素
     for (; i < vecdim; i++) {
         sum += static_cast<int32_t>(b1[i]) * static_cast<int32_t>(b2[i]);
+        b1_sum += b1[i];
+        b2_sum += b2[i];
     }
 
-    // 反量化结果 - 修正公式
-    // 原始数据: src1[i] = b1[i] * scale1 + offset1, src2[i] = b2[i] * scale2 + offset2
-    // 内积计算: sum(src1[i] * src2[i]) = sum((b1[i] * scale1 + offset1) * (b2[i] * scale2 + offset2))
-    // 展开: sum(b1[i] * b2[i] * scale1 * scale2 + b1[i] * scale1 * offset2 + b2[i] * scale2 * offset1 + offset1 * offset2)
-    
+    // 反量化结果公式: sum(b1[i]*b2[i])*scale1*scale2 + sum(b1[i])*scale1*offset2 + sum(b2[i])*scale2*offset1 + vecdim*offset1*offset2
+    // 优化反量化计算
     float scale_product = scale1 * scale2;
-    float sum_b1b2 = static_cast<float>(sum);
+    float offset_product = offset1 * offset2;
     
-    // 计算 b1 和 b2 的总和
-    int b1_sum = 0, b2_sum = 0;
-    for (size_t i = 0; i < vecdim; i++) {
-        b1_sum += static_cast<int>(b1[i]);
-        b2_sum += static_cast<int>(b2[i]);
-    }
-    
-    float ip = sum_b1b2 * scale_product + 
-              b1_sum * scale1 * offset2 + 
-              b2_sum * scale2 * offset1 + 
-              vecdim * offset1 * offset2;
+    float ip = static_cast<float>(sum) * scale_product + 
+              static_cast<float>(b1_sum) * scale1 * offset2 + 
+              static_cast<float>(b2_sum) * scale2 * offset1 + 
+              static_cast<float>(vecdim) * offset_product;
     
     return 1.0f - ip;  // 返回内积距离
 }
-
 
 // 使用标量量化的扁平扫描搜索函数
 std::priority_queue<std::pair<float, uint32_t>> flat_search_with_pq(
@@ -120,8 +255,8 @@ std::priority_queue<std::pair<float, uint32_t>> flat_search_with_pq(
     float query_scale, query_offset;
     quantize_vector(query, query_quantized, query_scale, query_offset, vecdim);
 
-    // 为所有基础向量分配量化内存
-    uint8_t* base_quantized = new uint8_t[base_number * vecdim];
+    // 为所有基础向量分配量化内存 - 使用对齐分配提高SIMD效率
+    uint8_t* base_quantized = new uint8_t[base_number * vecdim + 64];
     float* scales = new float[base_number];
     float* offsets = new float[base_number];
 

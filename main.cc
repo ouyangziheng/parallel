@@ -11,7 +11,7 @@
 #include <omp.h>
 #include "hnswlib/hnswlib/hnswlib.h"
 #include "flat_scan_with_simd.h"
-#include "flat_scan_with_pq.h"
+#include "flat_scan_with_pq01.h"
 // 可以自行添加需要的头文件
 
 using namespace hnswlib;
@@ -61,6 +61,29 @@ void build_index(float* base, size_t base_number, size_t vecdim)
     appr_alg->saveIndex(path_index);
 }
 
+// 构建PQ索引函数
+void build_pq_index(float* base, size_t base_number, size_t vecdim)
+{
+    // 对于128维向量，设置为4个子空间，每个子空间32维
+    size_t M = 4;  // 子空间数量
+    size_t K = 256; // 每个子空间的聚类中心数量
+    
+    std::cout << "构建PQ索引，子空间数量：" << M << "，类中心数量：" << K << std::endl;
+    
+    // 创建PQ索引
+    PQIndex* pq_index = new PQIndex(vecdim, M, K);
+    
+    // 构建索引
+    pq_index->build(base, base_number);
+    
+    // 保存索引以便后续使用
+    pq_index->save("files/pq.index");
+    
+    std::cout << "PQ索引构建完成并保存到 files/pq.index" << std::endl;
+    
+    // 释放内存
+    delete pq_index;
+}
 
 int main(int argc, char *argv[])
 {
@@ -85,6 +108,9 @@ int main(int argc, char *argv[])
     // 不建议在正式测试查询时同时构建索引，否则性能波动会较大
     // 下面是一个构建hnsw索引的示例
     // build_index(base, base_number, vecdim);
+    
+    // 构建PQ索引
+    build_pq_index(base, base_number, vecdim);
 
     
     // 查询测试代码
