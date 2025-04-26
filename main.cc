@@ -10,8 +10,16 @@
 #include <sys/time.h>
 #include <omp.h>
 #include "hnswlib/hnswlib/hnswlib.h"
-#include "flat_scan_with_simd.h"
-#include "flat_scan_with_pq01.h"
+// #include "flat_scan.h"
+// #include "flat_scan_with_simd.h"
+// #include "flat_scan_with_pq.h"
+#include "flat_scan_with_pq_njjl.h"
+#include <fstream>
+
+bool fileExists(const std::string& filename) {
+    std::ifstream file(filename);
+    return file.is_open();
+}
 // 可以自行添加需要的头文件
 
 using namespace hnswlib;
@@ -121,7 +129,7 @@ int main(int argc, char *argv[])
 
         // 该文件已有代码中你只能修改该函数的调用方式
         // 可以任意修改函数名，函数参数或者改为调用成员函数，但是不能修改函数返回值。
-        auto res = flat_search_with_pq(base, test_query + i*vecdim, base_number, vecdim, k);
+        auto res = flat_search_with_pq_Inner_Product(base, test_query + i*vecdim, base_number, vecdim, k);
 
         struct timeval newVal;
         ret = gettimeofday(&newVal, NULL);

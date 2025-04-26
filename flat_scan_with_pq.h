@@ -15,6 +15,16 @@
 
 #include "simd_utils.h"
 
+// 全局变量用于缓存已量化的向量
+namespace {
+    uint8_t* g_base_quantized = nullptr;
+    float* g_scales = nullptr;
+    float* g_offsets = nullptr;
+    size_t g_base_number = 0;
+    size_t g_vecdim = 0;
+    bool g_initialized = false;
+}
+
 template <typename T>
 T clamp(T value, T min_val, T max_val) {
     return std::max(min_val, std::min(value, max_val));
@@ -244,51 +254,122 @@ float inner_product_quantized(const uint8_t* b1, const uint8_t* b2,
     return 1.0f - ip;  // 返回内积距离
 }
 
-// 使用标量量化的扁平扫描搜索函数
+// 初始化量化数据 - 只在第一次调用时执行量化
+void init_quantized_data(float* base, size_t base_number, size_t vecdim) {
+    if (g_initialized && g_base_number == base_number && g_vecdim == vecdim) {
+        return; // 已经初始化过，无需重复操作
+    }
+    
+    // 清理之前的内存（如果有）
+    if (g_base_quantized) {
+        delete[] g_base_quantized;
+        delete[] g_scales;
+        delete[] g_offsets;
+    }
+    
+    // 分配新内存
+    g_base_quantized = new uint8_t[base_number * vecdim + 64]; // 添加额外对齐空间
+    g_scales = new float[base_number];
+    g_offsets = new float[base_number];
+    
+    // 并行量化所有基础向量
+    for (size_t i = 0; i < base_number; ++i) {
+        quantize_vector(base + i * vecdim, g_base_quantized + i * vecdim,
+                      g_scales[i], g_offsets[i], vecdim);
+    }
+    
+    g_base_number = base_number;
+    g_vecdim = vecdim;
+    g_initialized = true;
+}
+
+// 释放量化数据的内存
+void cleanup_quantized_data() {
+    if (g_base_quantized) {
+        delete[] g_base_quantized;
+        delete[] g_scales;
+        delete[] g_offsets;
+        g_base_quantized = nullptr;
+        g_scales = nullptr;
+        g_offsets = nullptr;
+        g_initialized = false;
+    }
+}
+
+// 使用标量量化的扁平扫描搜索函数 - 优化版本
 std::priority_queue<std::pair<float, uint32_t>> flat_search_with_pq(
     float* base, float* query, size_t base_number, size_t vecdim, size_t k) {
       
     std::priority_queue<std::pair<float, uint32_t>> q;
 
+    // 初始化/确保基础向量已量化
+    init_quantized_data(base, base_number, vecdim);
     // 量化查询向量
     uint8_t* query_quantized = new uint8_t[vecdim];
     float query_scale, query_offset;
     quantize_vector(query, query_quantized, query_scale, query_offset, vecdim);
 
-    // 为所有基础向量分配量化内存 - 使用对齐分配提高SIMD效率
-    uint8_t* base_quantized = new uint8_t[base_number * vecdim + 64];
-    float* scales = new float[base_number];
-    float* offsets = new float[base_number];
+    // 并行计算距离
+    std::vector<std::pair<float, uint32_t>> thread_results[omp_get_max_threads()];
+    
+    #pragma omp parallel
+    {
+        int thread_id = omp_get_thread_num();
+        int num_threads = omp_get_num_threads();
+        std::priority_queue<std::pair<float, uint32_t>> local_q;
+        
+        // 每个线程处理一部分向量
+        size_t start = (base_number * thread_id) / num_threads;
+        size_t end = (base_number * (thread_id + 1)) / num_threads;
+        
+        for (size_t i = start; i < end; ++i) {
+            float dis = inner_product_quantized(
+                g_base_quantized + i * vecdim, query_quantized, 
+                g_scales[i], g_offsets[i],
+                query_scale, query_offset, vecdim);
 
-// 使用多线程进行量化
-#pragma omp parallel for 
-    for (size_t i = 0; i < base_number; ++i) {
-        quantize_vector(base + i * vecdim, base_quantized + i * vecdim,
-                        scales[i], offsets[i], vecdim);
+            // 保持 top-k 最小距离
+            if (local_q.size() < k) {
+                local_q.push({dis, static_cast<uint32_t>(i)});
+            } else {
+                if (dis < local_q.top().first) {
+                    local_q.pop();
+                    local_q.push({dis, static_cast<uint32_t>(i)});
+                }
+            }
+        }
+        
+        // 将局部结果保存到线程结果数组
+        while (!local_q.empty()) {
+            thread_results[thread_id].push_back(local_q.top());
+            local_q.pop();
+        }
     }
-
-    // 计算量化后的距离
-    for (size_t i = 0; i < base_number; ++i) {
-        float dis = inner_product_quantized(
-            base_quantized + i * vecdim, query_quantized, scales[i], offsets[i],
-            query_scale, query_offset, vecdim);
-
-        // 保持 top-k 最小距离
-        if (q.size() < k) {
-            q.push({dis, static_cast<uint32_t>(i)});
-        } else {
-            if (dis < q.top().first) {
+    
+    // 合并所有线程的结果
+    for (int t = 0; t < omp_get_max_threads(); ++t) {
+        for (const auto& res : thread_results[t]) {
+            if (q.size() < k) {
+                q.push(res);
+            } else if (res.first < q.top().first) {
                 q.pop();
-                q.push({dis, static_cast<uint32_t>(i)});
+                q.push(res);
             }
         }
     }
 
-    // 释放内存
+    // 释放本次查询分配的内存
     delete[] query_quantized;
-    delete[] base_quantized;
-    delete[] scales;
-    delete[] offsets;
 
     return q;
 }
+
+// 析构函数释放全局内存 - 在程序结束时调用
+class GlobalMemoryCleanup {
+public:
+    ~GlobalMemoryCleanup() {
+        cleanup_quantized_data();
+    }
+};
+
+static GlobalMemoryCleanup g_cleanup;
