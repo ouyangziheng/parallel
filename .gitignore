@@ -6,3 +6,5 @@ files
 *.o
 *.e
 *.out
+*.csv
+*.txt

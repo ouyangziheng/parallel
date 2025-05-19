@@ -628,7 +628,7 @@ std::priority_queue<std::pair<float, uint32_t>> inner_product_search(
 // PQ索引类，优化内积距离搜索
 class PQIndex {
 public:
-  PQIndex(size_t d, size_t M = 12, size_t K = 256) : dim(d), pq(d, M, K), M(M) {}
+  PQIndex(size_t d, size_t M = 4, size_t K = 64) : dim(d), pq(d, M, K), M(M) {}
 
   // 构建索引
   void build(const float *data, size_t n) {
@@ -716,7 +716,7 @@ public:
         for (size_t i = b; i < end; i++) {
             float dist = pq.compute_distance(codes.data() + i * M);
             
-            if (pq_results.size() < k * 5) { // 减少候选数量，从k*10降到k*5
+            if (pq_results.size() < k * 20) { 
                 pq_results.push({dist, static_cast<uint32_t>(i)});
             } else if (dist < pq_results.top().first) {
                 pq_results.pop();
@@ -827,7 +827,7 @@ private:
   size_t dim;                       // 向量维度
   size_t M;                         // 子空间数量
   size_t n_data;                    // 数据点数量
-  ProductQuantizer pq;              // 产品量化器
+  ProductQuantizer pq;              // 量化器
   std::vector<uint8_t> codes;       // 编码数据
   std::vector<float> normalized_data; // 标准化数据
   const float* original_data_ptr;   // 原始数据指针(不复制数据)
@@ -861,7 +861,7 @@ void init_pq_index(float* base, size_t base_number, size_t vecdim) {
   
   // 设置合理的PQ参数 - 对于内积距离
   size_t M = 16;   // 增加子空间数量到16以提高精度
-  size_t K = 256;  // 每个子空间的聚类中心数量
+  size_t K = 64;  // 每个子空间的聚类中心数量
   
   std::cout << "创建新的内积距离优化PQ索引，M=" << M << ", K=" << K << std::endl;
   

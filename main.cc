@@ -118,7 +118,7 @@ int main(int argc, char *argv[])
     // build_index(base, base_number, vecdim);
     
     // 构建PQ索引
-    build_pq_index(base, base_number, vecdim);
+    // // // // // // // // // // // // // // // // // build_pq_index(base, base_number, vecdim);
 
     
     // 查询测试代码
