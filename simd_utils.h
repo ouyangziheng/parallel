@@ -60,3 +60,45 @@ float InnerProductSIMDNeon(const float* b1, const float* b2, size_t vecdim) {
     float dis = tmp[0] + tmp[1] + tmp[2] + tmp[3] + tmp[4] + tmp[5] + tmp[6] + tmp[7];
     return 1.0f - dis; // 返回内积距离
 }
+
+/**
+ * 优化的内积计算函数 - 用于IVF和其他搜索方法
+ * 
+ * 这个函数根据向量维度自动选择最合适的计算方法：
+ * 1. 如果维度能被8整除，使用SIMD NEON优化
+ * 2. 否则使用标量计算
+ * 
+ * @param b1 第一个向量
+ * @param b2 第二个向量
+ * @param vecdim 向量维度
+ * @return 向量的内积 (不是距离，即返回的是点积值)
+ */
+inline float simd_inner_product(const float* b1, const float* b2, size_t vecdim) {
+    // 初始化内积值
+    float ip = 0;
+    
+    // 确定能被SIMD处理的部分
+    size_t simd_vecdim = vecdim - (vecdim % 8);
+    
+    // 如果维度足够大，使用SIMD优化
+    if (simd_vecdim >= 8) {
+        // 每次处理8个元素
+        for (size_t i = 0; i < simd_vecdim; i += 8) {
+            simd8float32 s1(b1 + i), s2(b2 + i);
+            simd8float32 m = s1 * s2;
+            
+            float tmp[8];
+            m.storeu(tmp);
+            
+            // 累加结果
+            ip += tmp[0] + tmp[1] + tmp[2] + tmp[3] + tmp[4] + tmp[5] + tmp[6] + tmp[7];
+        }
+    }
+    
+    // 处理剩余的元素 (标量计算)
+    for (size_t i = simd_vecdim; i < vecdim; i++) {
+        ip += b1[i] * b2[i];
+    }
+    
+    return ip;
+}

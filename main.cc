@@ -13,7 +13,11 @@
 // #include "flat_scan.h"
 // #include "flat_scan_with_simd.h"
 // #include "flat_scan_with_pq.h"
-#include "flat_scan_with_pq_njjl.h"
+// #include "flat_scan_with_pq_njjl.h"
+#include "flat_scan_with_ivf.h"
+#include "flat_scan_with_ivf_pq.h"
+#include "hnsw_search.h" // 引入HNSW搜索头文件
+#include "ivf_hnsw_search.h" // 引入IVF+HNSW搜索头文件
 #include <fstream>
 
 bool fileExists(const std::string& filename) {
@@ -69,7 +73,8 @@ void build_index(float* base, size_t base_number, size_t vecdim)
     appr_alg->saveIndex(path_index);
 }
 
-// 构建PQ索引函数
+// 注释掉未使用的PQ索引构建函数，避免编译错误
+/*
 void build_pq_index(float* base, size_t base_number, size_t vecdim)
 {
     // 对于128维向量，设置为4个子空间，每个子空间32维
@@ -92,6 +97,7 @@ void build_pq_index(float* base, size_t base_number, size_t vecdim)
     // 释放内存
     delete pq_index;
 }
+*/
 
 int main(int argc, char *argv[])
 {
@@ -118,8 +124,36 @@ int main(int argc, char *argv[])
     // build_index(base, base_number, vecdim);
     
     // 构建PQ索引
-    // // // // // // // // // // // // // // // // // build_pq_index(base, base_number, vecdim);
-
+    // build_pq_index(base, base_number, vecdim);
+    
+    // // 构建IVF索引
+    // const size_t nlist = 512; // 簇的个数
+    // const size_t nprobe = 64; // 搜索时检查的簇数量
+    
+    // // IVF+PQ参数
+    // const size_t M = 64;       // PQ子空间数量
+    // const size_t K = 256;     // 每个子空间的聚类中心数量
+    // const bool use_pq_then_ivf = false; // true表示先PQ后IVF，false表示先IVF后PQ
+    
+    // 确保目录存在
+    std::cout << "确保files目录存在..." << std::endl;
+    system("mkdir -p files");
+    
+    // IVF+HNSW的参数设置
+    const size_t nlist = 512;   // 簇的个数
+    const size_t nprobe = 64;   // 搜索时检查的簇数量
+    const size_t ef_search = 300; // HNSW搜索参数
+    
+    // 检查IVF+HNSW索引是否存在，如果不存在则构建
+    std::cout << "检查IVF+HNSW索引是否存在..." << std::endl;
+    if (!fileExists("files/ivf_hnsw.index")) {
+        std::cout << "构建IVF+HNSW索引..." << std::endl;
+        build_ivf_hnsw_index(base, base_number, vecdim, nlist, nprobe, ef_search);
+    }
+    
+    // 预先加载索引
+    std::cout << "预加载IVF+HNSW索引..." << std::endl;
+    ensure_ivf_hnsw_index_initialized("files/ivf_hnsw.index", ef_search);
     
     // 查询测试代码
     for(int i = 0; i < test_number; ++i) {
@@ -127,9 +161,8 @@ int main(int argc, char *argv[])
         struct timeval val;
         int ret = gettimeofday(&val, NULL);
 
-        // 该文件已有代码中你只能修改该函数的调用方式
-        // 可以任意修改函数名，函数参数或者改为调用成员函数，但是不能修改函数返回值。
-        auto res = flat_search_with_pq_Inner_Product(base, test_query + i*vecdim, base_number, vecdim, k);
+        // 使用IVF+HNSW搜索
+        auto search_result = ivf_hnsw_search(base, test_query + i*vecdim, base_number, vecdim, k, nprobe, ef_search);
 
         struct timeval newVal;
         ret = gettimeofday(&newVal, NULL);
@@ -142,12 +175,12 @@ int main(int argc, char *argv[])
         }
 
         size_t acc = 0;
-        while (res.size()) {   
-            int x = res.top().second;
+        while (search_result.size()) {   
+            int x = search_result.top().second;
             if(gtset.find(x) != gtset.end()){
                 ++acc;
             }
-            res.pop();
+            search_result.pop();
         }
         float recall = (float)acc/k;
 
@@ -160,8 +193,11 @@ int main(int argc, char *argv[])
         avg_latency += results[i].latency;
     }
 
-    // 浮点误差可能导致一些精确算法平均recall不是1
-    std::cout << "average recall: "<<avg_recall / test_number<<"\n";
-    std::cout << "average latency (us): "<<avg_latency / test_number<<"\n";
+    std::cout << "平均召回率: " << avg_recall / test_number << "\n";
+    std::cout << "平均查询延迟 (微秒): " << avg_latency / test_number << "\n";
+    
+    // 释放索引资源
+    release_ivf_hnsw_index();
+    
     return 0;
 }
